@@ -14,10 +14,11 @@ async def main():
     from adapters.web_adapter import start_web
 
     logging.info("PriceGuard запускается...")
-    await init_db()
+    init_db()
     asyncio.create_task(start_web())
     asyncio.create_task(start_monitor())
     await start_bot()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
