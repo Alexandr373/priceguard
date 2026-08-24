@@ -27,6 +27,7 @@ async def cmd_start(message: types.Message):
         "/list — список товаров\n"
         "/violations — нарушения\n"
         "/del <id> — удалить товар\n"
+        "/debug — диагностика\n"
         "/help — справка"
     )
 
@@ -38,9 +39,24 @@ async def cmd_help(message: types.Message):
         "— добавит товар с мин. ценой 1500 ₽\n\n"
         "/list — все товары с текущими ценами\n"
         "/violations — история нарушений 289-ФЗ\n"
-        "/del 5 — удалить товар №5\n\n"
+        "/del 5 — удалить товар №5\n"
+        "/debug — проверить состояние бота\n\n"
         "Поддерживаются: Wildberries, Ozon"
     )
+
+@dp.message(Command("debug"))
+async def cmd_debug(message: types.Message):
+    try:
+        products = get_products(message.from_user.id)
+        all_products = get_products()
+        text = f"Диагностика:\n"
+        text += f"Твоих товаров: {len(products)}\n"
+        text += f"Всего товаров в базе: {len(all_products)}\n"
+        text += f"Токен задан: {'да' if TOKEN else 'нет'}\n"
+        text += f"Токен (начало): {TOKEN[:10]}...\n" if TOKEN else ""
+        await message.answer(text)
+    except Exception as e:
+        await message.answer(f"Ошибка диагностики: {e}")
 
 @dp.message(Command("add"))
 async def cmd_add(message: types.Message):
@@ -58,53 +74,93 @@ async def cmd_add(message: types.Message):
     if not platform:
         await message.answer("Не удалось определить маркетплейс. Поддерживаются WB и Ozon.")
         return
+
     await message.answer("Проверяю цену...")
+
     result = None
-    if platform == "wb":
-        result = await get_wb_price(link)
-    elif platform == "ozon":
-        result = await get_ozon_price(link)
+    try:
+        if platform == "wb":
+            result = await get_wb_price(link)
+        elif platform == "ozon":
+            result = await get_ozon_price(link)
+    except Exception as e:
+        logger.error(f"Ошибка парсера: {e}")
+
     name = result["name"] if result else ""
     current = result["price"] if result else min_price
-    pid = add_product(message.from_user.id, link, platform, min_price, name)
+
+    try:
+        pid = add_product(message.from_user.id, link, platform, min_price, name)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения в БД: {e}")
+        await message.answer(f"Ошибка при сохранении товара: {e}")
+        return
+
     if result and current != min_price:
-        update_price(pid, current)
+        try:
+            update_price(pid, current)
+        except Exception:
+            pass
+
     status = f"Товар добавлен (ID: {pid})\n"
     if result:
         status += f"Текущая цена: {current} ₽\nМинимальная: {min_price} ₽\n"
         if current < min_price:
             status += "Внимание: текущая цена уже ниже минимума!"
     else:
-        status += "Не удалось получить цену. Бот будет проверять автоматически."
+        status += "Не удалось получить цену с первого запроса. Бот будет проверять автоматически."
     status += f"\nПлощадка: {platform.upper()}"
     await message.answer(status)
 
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
-    products = get_products(message.from_user.id)
+    try:
+        products = get_products(message.from_user.id)
+    except Exception as e:
+        await message.answer(f"Ошибка базы данных: {e}")
+        return
+
     if not products:
         await message.answer("У тебя нет товаров. Добавь: /add <ссылка> <мин_цена>")
         return
     text = "Твои товары:\n\n"
     for p in products:
-        pid, _, link, platform, min_price, current_price, name = p[0], p[1], p[2], p[3], p[4], p[5], p[6]
+        pid = p[0]
+        link = p[2]
+        platform = p[3]
+        min_price = p[4]
+        current_price = p[5]
+        name = p[6] if len(p) > 6 else ""
         diff = " (!)" if current_price and min_price and current_price < min_price else ""
         text += f"#{pid} [{platform.upper()}] {name or 'Без названия'}\n"
-        text += f"   Тек: {current_price} ₽ | Мин: {min_price} ₽{diff}\n\n"
+        text += f"   Тек: {current_price} | Мин: {min_price}{diff}\n"
+        text += f"   {link}\n\n"
     await message.answer(text)
 
 @dp.message(Command("violations"))
 async def cmd_violations(message: types.Message):
-    violations = get_violations(message.from_user.id)
+    try:
+        violations = get_violations(message.from_user.id)
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+        return
+
     if not violations:
         await message.answer("Нарушений пока не найдено. Мониторинг работает.")
         return
     text = "Нарушения 289-ФЗ:\n\n"
     for v in violations:
-        vid, pid, old_p, new_p, detected, link, name, min_p = v
+        vid = v[0]
+        pid = v[1]
+        old_p = v[2]
+        new_p = v[3]
+        detected = v[4]
+        link = v[5]
+        name = v[6] if len(v) > 6 else ""
+        min_p = v[7] if len(v) > 7 else "?"
         text += f"#{vid} {name or 'Товар'}\n"
         text += f"   Было: {old_p} -> Стало: {new_p}\n"
-        text += f"   Минимум: {min_p} | Превышение: {min_p - new_p} ₽\n"
+        text += f"   Минимум: {min_p}\n"
         text += f"   Дата: {detected}\n\n"
     await message.answer(text)
 
@@ -127,9 +183,9 @@ async def send_violation_alert(violation):
     text = (
         f"НАРУШЕНИЕ 289-ФЗ\n\n"
         f"Товар: {violation.get('name', 'Товар')}\n"
-        f"Было: {violation['old_price']} ₽ -> Стало: {violation['new_price']} ₽\n"
-        f"Твой минимум: {violation['min_price']} ₽\n"
-        f"Превышение: {violation['min_price'] - violation['new_price']} ₽\n\n"
+        f"Было: {violation['old_price']} -> Стало: {violation['new_price']}\n"
+        f"Твой минимум: {violation['min_price']}\n"
+        f"Превышение: {violation['min_price'] - violation['new_price']}\n\n"
         f"{violation['link']}\n\n"
         f"Маркетплейс снизил цену ниже минимума без согласия."
     )
